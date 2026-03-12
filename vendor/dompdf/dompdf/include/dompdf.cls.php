@@ -483,8 +483,11 @@ class DOMPDF {
    *
    * @throws DOMPDF_Exception
    */
-  function load_html_file($file) {
+function load_html_file($file) {
     $this->save_locale();
+
+    // Remove null bytes to prevent null byte injection attacks
+    $file = str_replace(chr(0), '', $file);
 
     // Store parsing warnings as messages (this is to prevent output to the
     // browser if the html is ugly and the dom extension complains,
@@ -503,26 +506,53 @@ class DOMPDF {
 
     if ($this->_protocol == "" || $this->_protocol === "file://") {
 
-      // Get the full path to $file, returns false if the file doesn't exist
-      $realfile = realpath($file);
+      // Iteratively decode URL encoding to handle multiple/double encoding attacks
+      $decoded = $file;
+      do {
+          $file = $decoded;
+          $decoded = rawurldecode($file);
+      } while ($decoded !== $file);
+      
+      $file = $decoded;
 
-      $chroot = $this->get_option("chroot");
-      if ( strpos($realfile, $chroot) !== 0 ) {
-        throw new DOMPDF_Exception("Permission denied on $file. The file could not be found under the directory specified by DOMPDF_CHROOT.");
-      }
+      // Get the canonical path using realpath - performs ALL validation on canonical form
+      $realfile = realpath($file);
       
-      $ext = pathinfo($realfile, PATHINFO_EXTENSION);
-      if (!in_array($ext, $this->_allowed_local_file_extensions)) {
-        throw new DOMPDF_Exception("Permission denied on $file.");
-      }
-      
+      // Check if file exists and path is valid (realpath returns false if not)
       if ( !$realfile ) {
-        throw new DOMPDF_Exception("File '$file' not found.");
+        throw new DOMPDF_Exception("File '$file' not found or path cannot be resolved.");
       }
-            
+
+      // Get the canonical path of chroot for comparison
+      $chroot = realpath($this->get_option("chroot"));
+      
+      if ($chroot === false) {
+        throw new DOMPDF_Exception("Invalid chroot configuration.");
+      }
+      
+      // Validate canonical path is within chroot using directory separator to prevent bypass
+      if ( strpos($realfile . DIRECTORY_SEPARATOR, $chroot . DIRECTORY_SEPARATOR) !== 0 ) {
+        throw new DOMPDF_Exception("Permission denied on $file. The file is outside the directory specified by DOMPDF_CHROOT.");
+      }
+      
+      // Normalize extension to lowercase for case-insensitive comparison
+      $ext = strtolower(pathinfo($realfile, PATHINFO_EXTENSION));
+      
+      // Validate file extension against whitelist
+      if (!in_array($ext, $this->_allowed_local_file_extensions)) {
+        throw new DOMPDF_Exception("Permission denied on $file. File extension '$ext' is not allowed.");
+      }
+      
+      // Ensure the path is a regular file, not a directory or symlink to prevent bypass
+      if (!is_file($realfile)) {
+        throw new DOMPDF_Exception("Permission denied on $file. Path must be a regular file.");
+      }
+      
+      // Use the validated canonical path for file access to prevent TOCTOU race conditions
       $file = $realfile;
     }
     
+    // Access file using validated canonical path (not original user input)
     $contents = file_get_contents($file, null, $this->_http_context);
     $encoding = null;
 
@@ -541,26 +571,6 @@ class DOMPDF {
     $this->load_html($contents, $encoding);
   }
 
-  /**
-   * Loads an HTML string
-   * Parse errors are stored in the global array _dompdf_warnings.
-   * @todo use the $encoding variable
-   *
-   * @param string $str      HTML text to load
-   * @param string $encoding Not used yet
-   */
-  function load_html($str, $encoding = null) {
-    $this->save_locale();
-
-    // FIXME: Determine character encoding, switch to UTF8, update meta tag. Need better http/file stream encoding detection, currently relies on text or meta tag.
-    mb_detect_order('auto');
-
-    if (mb_detect_encoding($str) !== 'UTF-8') {
-      $metatags = array(
-        '@<meta\s+http-equiv="Content-Type"\s+content="(?:[\w/]+)(?:;\s*?charset=([^\s"]+))?@i',
-        '@<meta\s+content="(?:[\w/]+)(?:;\s*?charset=([^\s"]+))"?\s+http-equiv="Content-Type"@i',
-        '@<meta [^>]*charset\s*=\s*["\']?\s*([^"\' ]+)@i',
-      );
 
       foreach($metatags as $metatag) {
         if (preg_match($metatag, $str, $matches)) break;

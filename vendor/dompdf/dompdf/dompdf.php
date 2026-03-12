@@ -11,8 +11,108 @@
 
 /**
  * Display command line usage
+/**
+ * Parses command line options
+ * 
+ * @return array The command line options
+ */
+function getoptions() {
+
+  $opts = array();
+
+  if ( $_SERVER["argc"] == 1 )
+    return $opts;
+
+  $i = 1;
+  while ($i < $_SERVER["argc"]) {
+
+    switch ($_SERVER["argv"][$i]) {
+
+    case "--help":
+    case "-h":
+      $opts["h"] = true;
+      $i++;
+      break;
+
+    case "-l":
+      $opts["l"] = true;
+      $i++;
+      break;
+
+    case "-p":
+      if ( !isset($_SERVER["argv"][$i+1]) )
+        die("-p switch requires a size parameter\n");
+      $opts["p"] = $_SERVER["argv"][$i+1];
+      $i += 2;
+      break;
+
+    case "-o":
+      if ( !isset($_SERVER["argv"][$i+1]) )
+        die("-o switch requires an orientation parameter\n");
+      $opts["o"] = $_SERVER["argv"][$i+1];
+      $i += 2;
+      break;
+
+    case "-b":
+      if ( !isset($_SERVER["argv"][$i+1]) )
+        die("-b switch requires a path parameter\n");
+      // Store base path parameter without validation (will be validated during path resolution)
+      $opts["b"] = $_SERVER["argv"][$i+1];
+      $i += 2;
+      break;
+
+    case "-f":
+      if ( !isset($_SERVER["argv"][$i+1]) )
+        die("-f switch requires a filename parameter\n");
+      $opts["f"] = $_SERVER["argv"][$i+1];
+      $i += 2;
+      break;
+
+    case "-v":
+      $opts["v"] = true;
+      $i++;
+      break;
+
+    case "-d":
+      $opts["d"] = true;
+      $i++;
+      break;
+
+    case "-t":
+      if ( !isset($_SERVER['argv'][$i + 1]) )
+        die("-t switch requires a comma separated list of types\n");
+      $opts["t"] = $_SERVER['argv'][$i+1];
+      $i += 2;
+      break;
+
+   default:
+      // Store filename parameter without validation (will be validated during path resolution)
+      $opts["filename"] = $_SERVER["argv"][$i];
+      $i++;
+      break;
+    }
+
+  }
+  return $opts;
+}
+
+    if ($chroot_real === false) {
+        throw new DOMPDF_Exception("Invalid chroot configuration.");
+    }
+    
+    // Validate canonical path is within chroot using directory separator to prevent bypass
+    if (strpos($realfile . DIRECTORY_SEPARATOR, $chroot_real . DIRECTORY_SEPARATOR) !== 0) {
+        throw new DOMPDF_Exception("Permission denied: file path is outside allowed directory.");
+    }
+    
+    return $realfile;
+}
+
+/**
+ * Display usage information for dompdf CLI
  */
 function dompdf_usage() {
+
   $default_paper_size = DOMPDF_DEFAULT_PAPER_SIZE;
   
   echo <<<EOD
@@ -149,7 +249,13 @@ switch ( $sapi ) {
       echo "  " . mb_strtoupper($size) . "\n";
     exit;
   }
+  
+  // Validate filename from CLI using canonical path resolution
   $file = $opts["filename"];
+  if ($file !== "-") {
+    // Apply canonical path validation for CLI input to prevent directory traversal
+    $file = validate_file_path($file, DOMPDF_CHROOT);
+  }
 
   if ( isset($opts["p"]) )
     $paper = $opts["p"];
@@ -161,8 +267,10 @@ switch ( $sapi ) {
   else
     $orientation = "portrait";
 
-  if ( isset($opts["b"]) )
-    $base_path = $opts["b"];
+  if ( isset($opts["b"]) ) {
+    // Validate base_path from CLI using canonical path resolution
+    $base_path = validate_file_path($opts["b"], DOMPDF_CHROOT);
+  }
 
   if ( isset($opts["f"]) )
     $outfile = $opts["f"];
@@ -197,10 +305,12 @@ switch ( $sapi ) {
 
   $dompdf->set_option('enable_php', false);
   
-  if ( isset($_GET["input_file"]) )
+  if ( isset($_GET["input_file"]) ) {
+    // Decode input_file parameter (validation happens after concatenation)
     $file = rawurldecode($_GET["input_file"]);
-  else
+  } else {
     throw new DOMPDF_Exception("An input file is required (i.e. input_file _GET variable).");
+  }
   
   if ( isset($_GET["paper"]) )
     $paper = rawurldecode($_GET["paper"]);
@@ -212,10 +322,47 @@ switch ( $sapi ) {
   else
     $orientation = "portrait";
   
+  // Enhanced validation: concatenate paths FIRST, then validate the complete path
   if ( isset($_GET["base_path"]) ) {
-    $base_path = rawurldecode($_GET["base_path"]);
-    $file = $base_path . $file; # Set the input file
-  }  
+    $base_path_input = rawurldecode($_GET["base_path"]);
+    
+    // Remove null bytes from base_path
+    $base_path_input = str_replace(chr(0), '', $base_path_input);
+    
+    // Iteratively decode to handle multiple encoding layers
+    $decoded = $base_path_input;
+    do {
+        $base_path_input = $decoded;
+        $decoded = rawurldecode($base_path_input);
+    } while ($decoded !== $base_path_input);
+    
+    $base_path_input = $decoded;
+    
+    // Safely join paths with proper separator handling BEFORE validation
+    $combined_path = rtrim($base_path_input, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . ltrim($file, DIRECTORY_SEPARATOR);
+    
+    // Validate the COMPLETE concatenated path using canonical resolution
+    $file = validate_file_path($combined_path, DOMPDF_CHROOT);
+    
+    // Extract validated base_path from canonical file path for set_base_path()
+    $base_path = dirname($file);
+  } else {
+    // No base_path provided, validate file directly
+    // Remove null bytes from file
+    $file = str_replace(chr(0), '', $file);
+    
+    // Iteratively decode to handle multiple encoding layers
+    $decoded = $file;
+    do {
+        $file = $decoded;
+        $decoded = rawurldecode($file);
+    } while ($decoded !== $file);
+    
+    $file = $decoded;
+    
+    // Validate using canonical path resolution
+    $file = validate_file_path($file, DOMPDF_CHROOT);
+  }
   
   if ( isset($_GET["options"]) ) {
     $options = $_GET["options"];
@@ -277,3 +424,4 @@ if ( $save_file ) {
 if ( !headers_sent() ) {
   $dompdf->stream($outfile, $options);
 }
+
