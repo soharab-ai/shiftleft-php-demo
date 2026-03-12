@@ -60,55 +60,95 @@ class HTML5_Data
         else return self::$realCodepointTable[$ref];
     }
 
-    public static function getNamedCharacterReferences() {
-        if (!self::$namedCharacterReferences) {
-            self::$namedCharacterReferences = unserialize(
-                file_get_contents(dirname(__FILE__) . '/named-character-references.ser'));
-        }
-        return self::$namedCharacterReferences;
-    }
-
-    /**
-     * Converts a Unicode codepoint to sequence of UTF-8 bytes.
-     * @note Shamelessly stolen from HTML Purifier, which is also
-     *       shamelessly stolen from Feyd (which is in public domain).
-     */
-    public static function utf8chr($code) {
-        /* We don't care: we live dangerously
-         * if($code > 0x10FFFF or $code < 0x0 or
-          ($code >= 0xD800 and $code <= 0xDFFF) ) {
-            // bits are set outside the "valid" range as defined
-            // by UNICODE 4.1.0
-            return "\xEF\xBF\xBD";
-          }*/
-
-        $x = $y = $z = $w = 0;
-        if ($code < 0x80) {
-            // regular ASCII character
-            $x = $code;
-        } else {
-            // set up bits for UTF-8
-            $x = ($code & 0x3F) | 0x80;
-            if ($code < 0x800) {
-               $y = (($code & 0x7FF) >> 6) | 0xC0;
-            } else {
-                $y = (($code & 0xFC0) >> 6) | 0x80;
-                if($code < 0x10000) {
-                    $z = (($code >> 12) & 0x0F) | 0xE0;
-                } else {
-                    $z = (($code >> 12) & 0x3F) | 0x80;
-                    $w = (($code >> 18) & 0x07) | 0xF0;
-                }
+public static function getNamedCharacterReferences() {
+    if (!self::$namedCharacterReferences) {
+        // MITIGATION: Define maximum allowed file size to prevent DoS attacks (5MB)
+        $maxFileSize = 5 * 1024 * 1024;
+        
+        $jsonFilePath = dirname(__FILE__) . '/named-character-references.json';
+        $serFilePath = dirname(__FILE__) . '/named-character-references.ser';
+        
+        // MITIGATION: One-time migration from .ser to .json if needed
+        if (!file_exists($jsonFilePath) && file_exists($serFilePath)) {
+            // Perform one-time migration with controlled conditions
+            if (filesize($serFilePath) > $maxFileSize) {
+                throw new RuntimeException('Serialized file exceeds maximum allowed size during migration');
             }
+            
+            $serializedData = file_get_contents($serFilePath);
+            // MITIGATION: Use allowed_classes => false during migration only
+            $migratedData = unserialize($serializedData, ['allowed_classes' => false]);
+            
+            if ($migratedData === false) {
+                throw new RuntimeException('Failed to unserialize data during migration');
+            }
+            
+            // Convert to JSON format
+            $jsonData = json_encode($migratedData);
+            if ($jsonData === false) {
+                throw new RuntimeException('Failed to encode data to JSON during migration');
+            }
+            
+            // Write JSON file
+            if (file_put_contents($jsonFilePath, $jsonData) === false) {
+                throw new RuntimeException('Failed to write JSON file during migration');
+            }
+            
+            // Rename .ser file to prevent future use
+            @rename($serFilePath, $serFilePath . '.migrated');
+            
+            // Log migration event for audit purposes
+            error_log('Named character references migrated from .ser to .json format');
         }
-        // set up the actual character
-        $ret = '';
-        if($w) $ret .= chr($w);
-        if($z) $ret .= chr($z);
-        if($y) $ret .= chr($y);
-        $ret .= chr($x);
-
-        return $ret;
+        
+        // MITIGATION: Verify JSON file exists after migration
+        if (!file_exists($jsonFilePath)) {
+            throw new RuntimeException('Named character references JSON file not found');
+        }
+        
+        // MITIGATION: Check file size before loading to prevent memory exhaustion
+        if (filesize($jsonFilePath) > $maxFileSize) {
+            throw new RuntimeException('Character references file exceeds maximum allowed size');
+        }
+        
+        // MITIGATION: Load JSON file content
+        $jsonContent = file_get_contents($jsonFilePath);
+        if ($jsonContent === false) {
+            throw new RuntimeException('Failed to read character references file');
+        }
+        
+        // MITIGATION: Use json_decode as safe alternative to unserialize
+        self::$namedCharacterReferences = json_decode($jsonContent, true);
+        
+        // MITIGATION: Validate JSON decoding result
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new RuntimeException('Failed to decode character references: ' . json_last_error_msg());
+        }
+        
+        // MITIGATION: Strict data type validation - ensure result is an array
+        if (!is_array(self::$namedCharacterReferences)) {
+            throw new RuntimeException('Invalid character references format: expected array');
+private static function validateCharacterReferences($data) {
+    // MITIGATION: Schema validation to prevent JSON injection attacks
+    foreach ($data as $key => $value) {
+        // Validate key is a string
+        if (!is_string($key)) {
+            throw new RuntimeException('Invalid character reference: key must be a string');
+        }
+        
+        // Validate key matches expected character reference pattern (alphanumeric with optional semicolon)
+        if (!preg_match('/^[a-zA-Z0-9]+;?$/', $key)) {
+            throw new RuntimeException('Invalid character reference key format: ' . htmlspecialchars($key, ENT_QUOTES, 'UTF-8'));
+        }
+        
+        // Validate value is an array
+        if (!is_array($value)) {
+            throw new RuntimeException('Invalid character reference value: expected array for key ' . htmlspecialchars($key, ENT_QUOTES, 'UTF-8'));
+        }
+        
+        // Validate value contains exactly two integer elements (character codes)
+        if (count($value) !== 2 || !is_int($value[0]) || !is_int($value[1])) {
+            throw new RuntimeException('Invalid character reference value structure for key ' . htmlspecialchars($key, ENT_QUOTES, 'UTF-8'));
+        }
     }
-
 }
