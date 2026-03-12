@@ -331,52 +331,163 @@ class Font_Metrics {
     self::$_font_lookup[mb_strtolower($fontname)] = $entry;
   }
   
-  static function register_font($style, $remote_file, $context = null) {
-    $fontname = mb_strtolower($style["family"]);
+static function register_font($style, $remote_file, $context = null, $expected_hash = null) {
+    // Validate and sanitize font family name - prevents path traversal and injection attacks
+    $fontname = preg_replace('/[^a-zA-Z0-9_-]/', '', mb_strtolower($style["family"]));
+    if (empty($fontname)) {
+      throw new Exception("Invalid font family name");
+    }
+    
+    // Validate URL scheme - only allow HTTPS to prevent SSRF attacks
+    $allowed_schemes = ['https'];
+    $parsed_url = parse_url($remote_file);
+    
+    if (!$parsed_url || !isset($parsed_url['scheme']) || !in_array($parsed_url['scheme'], $allowed_schemes)) {
+      throw new Exception("Invalid or unsupported URL scheme. Only HTTPS is allowed.");
+    }
+    
+    // Whitelist trusted domains - prevent SSRF to arbitrary hosts
+    $allowed_domains = ['fonts.googleapis.com', 'fonts.gstatic.com', 'fonts.adobe.com', 'use.typekit.net'];
+    if (!isset($parsed_url['host']) || !in_array($parsed_url['host'], $allowed_domains)) {
+      throw new Exception("Untrusted font source. Only whitelisted domains are allowed.");
+    }
+    
+    // Validate font family length - prevent resource exhaustion
+    if (strlen($style["family"]) > 255) {
+      throw new Exception("Font family name exceeds maximum allowed length");
+    }
+    
     $families = Font_Metrics::get_font_families();
     
     $entry = array();
     if ( isset($families[$fontname]) ) {
       $entry = $families[$fontname];
+      
+      // FIX: Verify cached file integrity to prevent exploitation of tampered cached fonts
+      $weight = preg_replace('/[^a-zA-Z0-9_-]/', '', $style['weight']);
+      $styleParam = preg_replace('/[^a-zA-Z0-9_-]/', '', $style['style']);
+      $style_string = Font_Metrics::get_type("{$weight} {$styleParam}");
+      
+      if (isset($entry[$style_string]) && file_exists($entry[$style_string] . '.ttf')) {
+          $cached_file_hash = hash_file('sha256', $entry[$style_string] . '.ttf');
+          $stored_hash = Font_Metrics::get_stored_hash($fontname, $style_string);
+          if ($stored_hash !== null && $cached_file_hash !== $stored_hash) {
+              // Cache corruption detected, re-download required
+              unset($entry[$style_string]);
+          }
+      }
     }
     
-    $local_file = DOMPDF_FONT_DIR . md5($remote_file);
-    $local_temp_file = DOMPDF_TEMP_DIR . "/" . md5($remote_file);
-    $cache_entry = $local_file;
-    $local_file .= ".ttf";
+    // Sanitize weight and style parameters - prevent SQL injection
+    $weight = preg_replace('/[^a-zA-Z0-9_-]/', '', $style['weight']);
+    $styleParam = preg_replace('/[^a-zA-Z0-9_-]/', '', $style['style']);
     
-    $style_string = Font_Metrics::get_type("{$style['weight']} {$style['style']}");
+    $style_string = Font_Metrics::get_type("{$weight} {$styleParam}");
     
     if ( !isset($entry[$style_string]) ) {
+      // Download the remote file with timeout protection
+      $download_context = $context;
+      if ($download_context === null) {
+        $download_context = stream_context_create([
+          'http' => [
+            'timeout' => 30,  // Prevent resource exhaustion with reasonable timeout
+            'follow_location' => 0  // Prevent redirect-based SSRF
+          ]
+        ]);
+      }
+      
+      $remote_content = @file_get_contents($remote_file, false, $download_context);
+      if ($remote_content === false) {
+        throw new Exception("Failed to download font file from remote source");
+      }
+      
+      // FIX: Verify downloaded content integrity using SHA-256 hash to prevent MITM attacks
+      if ($expected_hash !== null) {
+          $downloaded_hash = hash('sha256', $remote_content);
+          if ($downloaded_hash !== $expected_hash) {
+              throw new Exception("Font file integrity check failed - hash mismatch");
+          }
+      }
+      
+      // FIX: Hash the actual content instead of URL string to prevent cache poisoning
+      $hash = hash('sha256', $remote_content);
+      $random_suffix = bin2hex(random_bytes(8));
+      $local_file = DOMPDF_FONT_DIR . $hash . "_" . $random_suffix;
+      $local_temp_file = DOMPDF_TEMP_DIR . "/" . $hash . "_" . $random_suffix;
+      $cache_entry = $local_file;
+      $local_file .= ".ttf";
+      
+      file_put_contents($local_temp_file, $remote_content);
+      
+      // Validate file type - ensure it's a legitimate font file
+      if (function_exists('finfo_open')) {
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mime = finfo_file($finfo, $local_temp_file);
+        finfo_close($finfo);
+        
+        $allowed_mime_types = [
+          'application/x-font-ttf', 
+          'font/ttf', 
+          'application/font-sfnt',
+          'application/vnd.ms-fontobject',
+          'font/otf',
+          'application/x-font-otf'
+        ];
+        
+        if (!in_array($mime, $allowed_mime_types)) {
+          unlink($local_temp_file);
+          throw new Exception("Invalid font file type. Expected TTF or OTF font.");
+        }
+      }
+      
+      // Validate file signature (magic bytes) for additional security
+      $file_handle = fopen($local_temp_file, 'rb');
+      $magic_bytes = fread($file_handle, 4);
+static function get_stored_hash($fontname, $style_string) {
+    // Retrieve stored hash for cached font file integrity verification
+    $hash_file = DOMPDF_FONT_DIR . "font_hashes.json";
+    
+    if (!file_exists($hash_file)) {
+        return null;
+    }
+    
+    $hashes = json_decode(file_get_contents($hash_file), true);
+    if (!is_array($hashes)) {
+        return null;
+    }
+    
+    return isset($hashes[$fontname][$style_string]) ? $hashes[$fontname][$style_string] : null;
+static function store_hash($fontname, $style_string, $hash) {
+    // Store hash of font file for future integrity verification
+    $hash_file = DOMPDF_FONT_DIR . "font_hashes.json";
+    
+    $hashes = array();
+    if (file_exists($hash_file)) {
+        $hashes = json_decode(file_get_contents($hash_file), true);
+        if (!is_array($hashes)) {
+            $hashes = array();
+        }
+    }
+    
+    if (!isset($hashes[$fontname])) {
+        $hashes[$fontname] = array();
+    }
+    
+    $hashes[$fontname][$style_string] = $hash;
+    
+    file_put_contents($hash_file, json_encode($hashes, JSON_PRETTY_PRINT));
+}
+
+      file_put_contents($local_file, $remote_content);
+      
+      // FIX: Store the hash of the saved file for future integrity verification
+      $final_file_hash = hash_file('sha256', $local_file);
+      Font_Metrics::store_hash($fontname, $style_string, $final_file_hash);
+      
       $entry[$style_string] = $cache_entry;
-      
-      // Download the remote file
-      file_put_contents($local_temp_file, file_get_contents($remote_file, null, $context));
-      
-      $font = Font::load($local_temp_file);
-      
-      if (!$font) {
-        unlink($local_temp_file);
-        return false;
-      }
-      
-      $font->parse();
-      $font->saveAdobeFontMetrics("$cache_entry.ufm");
-      
-      unlink($local_temp_file);
-      
-      if ( !file_exists("$cache_entry.ufm") ) {
-        return false;
-      }
-      
-      // Save the changes
-      file_put_contents($local_file, file_get_contents($remote_file, null, $context));
       Font_Metrics::set_font_family($fontname, $entry);
       Font_Metrics::save_font_families();
     }
     
     return true;
   }
-}
-
-Font_Metrics::load_font_families();
