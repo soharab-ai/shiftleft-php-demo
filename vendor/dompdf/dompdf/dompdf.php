@@ -149,7 +149,30 @@ switch ( $sapi ) {
       echo "  " . mb_strtoupper($size) . "\n";
     exit;
   }
+  
+  // SECURITY FIX: Restrict CLI file operations to designated input directory
+  if (!defined('CLI_INPUT_DIRECTORY')) {
+      define('CLI_INPUT_DIRECTORY', DOMPDF_CHROOT . '/input/');
+  }
+  
   $file = $opts["filename"];
+  
+  // SECURITY FIX: Enforce directory containment for CLI operations
+  $cliInputDir = realpath(CLI_INPUT_DIRECTORY);
+  if ($cliInputDir === false) {
+      die("Error: CLI input directory not configured properly\n");
+  }
+  
+  // If relative path, prepend the CLI input directory
+  if ($file[0] !== '/') {
+      $file = $cliInputDir . DIRECTORY_SEPARATOR . $file;
+  }
+  
+  $resolved = realpath($file);
+  if ($resolved === false || strpos($resolved, $cliInputDir) !== 0) {
+      die("Error: File must be in designated input directory: " . CLI_INPUT_DIRECTORY . "\n");
+  }
+  $file = $resolved;
 
   if ( isset($opts["p"]) )
     $paper = $opts["p"];
@@ -182,7 +205,8 @@ switch ( $sapi ) {
   }
 
   if ( isset($opts['t']) ) {
-    $arr = split(',',$opts['t']);
+    // SECURITY FIX: Use explode instead of deprecated split
+    $arr = explode(',',$opts['t']);
     $types = array();
     foreach ($arr as $type)
       $types[ trim($type) ] = 1;
@@ -197,10 +221,54 @@ switch ( $sapi ) {
 
   $dompdf->set_option('enable_php', false);
   
-  if ( isset($_GET["input_file"]) )
-    $file = rawurldecode($_GET["input_file"]);
-  else
-    throw new DOMPDF_Exception("An input file is required (i.e. input_file _GET variable).");
+  // SECURITY FIX: Implement token-based file access for web requests
+  // Replace direct file path handling with secure token lookup
+  if ( isset($_GET["file_token"]) ) {
+    $file_token = $_GET["file_token"];
+    $file = $dompdf->lookupFileByToken($file_token);
+    
+    if ($file === null) {
+      throw new DOMPDF_Exception("Invalid file token provided");
+    }
+  } elseif ( isset($_GET["input_file"]) ) {
+    // SECURITY FIX: Strict filename validation - reject path separators upfront
+    $input = rawurldecode($_GET["input_file"]);
+    
+    if (strpos($input, '/') !== false || 
+        strpos($input, '\\') !== false || 
+        strpos($input, "\0") !== false) {
+      throw new DOMPDF_Exception("Filename must not contain path separators");
+    }
+    
+    // SECURITY FIX: Validate filename contains only safe characters
+    $validatedFilename = $dompdf->validateFilenameCharacters($input);
+    
+    // SECURITY FIX: If base_path provided, validate it and construct path securely
+    if ( isset($_GET["base_path"]) ) {
+      $base_path_input = rawurldecode($_GET["base_path"]);
+      $chroot = $dompdf->get_option("chroot");
+      
+      // Resolve base_path to absolute path
+      $resolvedBasePath = realpath($base_path_input);
+      if ($resolvedBasePath === false) {
+        throw new DOMPDF_Exception("Invalid base_path: path does not exist");
+      }
+      
+      // Ensure base_path is within chroot
+      $normalizedChroot = rtrim(realpath($chroot), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+      if (strpos($resolvedBasePath . DIRECTORY_SEPARATOR, $normalizedChroot) !== 0) {
+        throw new DOMPDF_Exception("Invalid base_path: outside allowed directory");
+      }
+      
+      $base_path = $resolvedBasePath;
+      $file = rtrim($base_path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $validatedFilename;
+    } else {
+      // SECURITY FIX: Use chroot directory when no base_path specified
+      $file = rtrim($dompdf->get_option("chroot"), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $validatedFilename;
+    }
+  } else {
+    throw new DOMPDF_Exception("An input file or file token is required (i.e. file_token or input_file _GET variable).");
+  }
   
   if ( isset($_GET["paper"]) )
     $paper = rawurldecode($_GET["paper"]);
@@ -211,11 +279,6 @@ switch ( $sapi ) {
     $orientation = rawurldecode($_GET["orientation"]);
   else
     $orientation = "portrait";
-  
-  if ( isset($_GET["base_path"]) ) {
-    $base_path = rawurldecode($_GET["base_path"]);
-    $file = $base_path . $file; # Set the input file
-  }  
   
   if ( isset($_GET["options"]) ) {
     $options = $_GET["options"];
@@ -256,14 +319,12 @@ if ( $_dompdf_show_warnings ) {
 }
 
 if ( $save_file ) {
-//   if ( !is_writable($outfile) )
-//     throw new DOMPDF_Exception("'$outfile' is not writable.");
   if ( strtolower(DOMPDF_PDF_BACKEND) === "gd" )
     $outfile = str_replace(".pdf", ".png", $outfile);
 
   list($proto, $host, $path, $file) = explode_url($outfile);
-  if ( $proto != "" ) // i.e. not file://
-    $outfile = $file; // just save it locally, FIXME? could save it like wget: ./host/basepath/file
+  if ( $proto != "" )
+    $outfile = $file;
 
   $outfile = realpath(dirname($outfile)) . DIRECTORY_SEPARATOR . basename($outfile);
 
@@ -277,3 +338,4 @@ if ( $save_file ) {
 if ( !headers_sent() ) {
   $dompdf->stream($outfile, $options);
 }
+
