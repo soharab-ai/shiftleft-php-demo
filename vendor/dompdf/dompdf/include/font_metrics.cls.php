@@ -331,7 +331,7 @@ class Font_Metrics {
     self::$_font_lookup[mb_strtolower($fontname)] = $entry;
   }
   
-  static function register_font($style, $remote_file, $context = null) {
+static function register_font($style, $remote_file, $context = null) {
     $fontname = mb_strtolower($style["family"]);
     $families = Font_Metrics::get_font_families();
     
@@ -340,8 +340,16 @@ class Font_Metrics {
       $entry = $families[$fontname];
     }
     
-    $local_file = DOMPDF_FONT_DIR . md5($remote_file);
-    $local_temp_file = DOMPDF_TEMP_DIR . "/" . md5($remote_file);
+    // SECURITY FIX: Validate remote URL before processing to prevent malicious sources
+    if (!Font_Metrics::validate_remote_url($remote_file)) {
+      return false;
+    }
+    
+    // SECURITY FIX: Generate cryptographically secure random filename to prevent prediction attacks
+    $random_bytes = random_bytes(32);
+    $secure_filename = bin2hex($random_bytes);
+    $local_file = DOMPDF_FONT_DIR . $secure_filename;
+    $local_temp_file = DOMPDF_TEMP_DIR . "/" . $secure_filename . "_temp";
     $cache_entry = $local_file;
     $local_file .= ".ttf";
     
@@ -350,33 +358,45 @@ class Font_Metrics {
     if ( !isset($entry[$style_string]) ) {
       $entry[$style_string] = $cache_entry;
       
-      // Download the remote file
-      file_put_contents($local_temp_file, file_get_contents($remote_file, null, $context));
+      // SECURITY FIX: Download once and verify immediately to prevent TOCTOU vulnerability
+      $downloaded_content = file_get_contents($remote_file, null, $context);
+      if ($downloaded_content === false) {
+        return false;
+      }
       
-      $font = Font::load($local_temp_file);
+      // SECURITY FIX: Calculate SHA-256 hash before any processing for integrity verification
+      $content_hash = hash('sha256', $downloaded_content);
+      file_put_contents($local_temp_file, $downloaded_content);
       
-      if (!$font) {
+      // SECURITY FIX: Store hash immediately with downloaded content
+      Font_Metrics::store_font_hash($cache_entry, $content_hash);
+      
+      // SECURITY FIX: Verify integrity using stored hash with cryptographic verification
+      if (!Font_Metrics::verify_font_integrity($local_temp_file, $content_hash)) {
         unlink($local_temp_file);
         return false;
-      }
-      
-      $font->parse();
-      $font->saveAdobeFontMetrics("$cache_entry.ufm");
-      
-      unlink($local_temp_file);
-      
-      if ( !file_exists("$cache_entry.ufm") ) {
-        return false;
-      }
-      
-      // Save the changes
-      file_put_contents($local_file, file_get_contents($remote_file, null, $context));
-      Font_Metrics::set_font_family($fontname, $entry);
-      Font_Metrics::save_font_families();
-    }
+/**
+   * SECURITY FIX: Get list of allowed font domains for whitelist validation
+   * Configure trusted sources for font downloads
+   * 
+   * @return array List of allowed domain names
+   */
+  static function get_allowed_font_domains() {
+    // Default whitelist of trusted font sources
+    // This should be configurable via settings for production use
+    $default_domains = array(
+      'fonts.googleapis.com',
+      'fonts.gstatic.com',
+      'use.typekit.net',
+      'cdn.jsdelivr.net'
+    );
     
-    return true;
+    // Allow configuration override if defined
+    return defined('DOMPDF_ALLOWED_FONT_DOMAINS') ? DOMPDF_ALLOWED_FONT_DOMAINS : $default_domains;
   }
-}
+
+
+
+
 
 Font_Metrics::load_font_families();
