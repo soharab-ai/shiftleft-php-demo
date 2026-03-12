@@ -483,12 +483,10 @@ class DOMPDF {
    *
    * @throws DOMPDF_Exception
    */
-  function load_html_file($file) {
+function load_html_file($file) {
     $this->save_locale();
 
-    // Store parsing warnings as messages (this is to prevent output to the
-    // browser if the html is ugly and the dom extension complains,
-    // preventing the pdf from being streamed.)
+    // Store parsing warnings as messages
     if ( !$this->_protocol && !$this->_base_host && !$this->_base_path ) {
       list($this->_protocol, $this->_base_host, $this->_base_path) = explode_url($file);
     }
@@ -503,21 +501,17 @@ class DOMPDF {
 
     if ($this->_protocol == "" || $this->_protocol === "file://") {
 
-      // Get the full path to $file, returns false if the file doesn't exist
-      $realfile = realpath($file);
-
-      $chroot = $this->get_option("chroot");
-      if ( strpos($realfile, $chroot) !== 0 ) {
-        throw new DOMPDF_Exception("Permission denied on $file. The file could not be found under the directory specified by DOMPDF_CHROOT.");
-      }
+      // SECURITY FIX: Implement allowlist-based file access control
+      // This replaces reactive path validation with proactive restriction
+      $realfile = $this->validateFileInAllowlist($file);
       
-      $ext = pathinfo($realfile, PATHINFO_EXTENSION);
-      if (!in_array($ext, $this->_allowed_local_file_extensions)) {
-        throw new DOMPDF_Exception("Permission denied on $file.");
-      }
+      // SECURITY FIX: Enhanced extension validation with case-insensitive comparison
+      $ext = strtolower(pathinfo($realfile, PATHINFO_EXTENSION));
+      $allowedExtensions = array_map('strtolower', $this->_allowed_local_file_extensions);
       
-      if ( !$realfile ) {
-        throw new DOMPDF_Exception("File '$file' not found.");
+      if (!in_array($ext, $allowedExtensions)) {
+        $this->logSecurityEvent("Unauthorized File Extension", "File: $file, Extension: $ext");
+        throw new DOMPDF_Exception("Permission denied on $file. File type not allowed: .$ext");
       }
             
       $file = $realfile;
@@ -541,30 +535,25 @@ class DOMPDF {
     $this->load_html($contents, $encoding);
   }
 
-  /**
-   * Loads an HTML string
-   * Parse errors are stored in the global array _dompdf_warnings.
-   * @todo use the $encoding variable
-   *
-   * @param string $str      HTML text to load
-   * @param string $encoding Not used yet
-   */
-  function load_html($str, $encoding = null) {
-    $this->save_locale();
+    error_log($logMessage);
+}
 
-    // FIXME: Determine character encoding, switch to UTF8, update meta tag. Need better http/file stream encoding detection, currently relies on text or meta tag.
-    mb_detect_order('auto');
 
-    if (mb_detect_encoding($str) !== 'UTF-8') {
-      $metatags = array(
-        '@<meta\s+http-equiv="Content-Type"\s+content="(?:[\w/]+)(?:;\s*?charset=([^\s"]+))?@i',
-        '@<meta\s+content="(?:[\w/]+)(?:;\s*?charset=([^\s"]+))"?\s+http-equiv="Content-Type"@i',
-        '@<meta [^>]*charset\s*=\s*["\']?\s*([^"\' ]+)@i',
-      );
+    // Strict comparison - file must exactly match an allowed path
+    if (!in_array($realfile, $allowedPaths, true)) {
+        $this->logSecurityEvent("Unauthorized File Access Attempt", "File: $realfile");
+        throw new DOMPDF_Exception("Access denied: File not in allowlist.");
+    }
+    
+    return $realfile;
+}
 
-      foreach($metatags as $metatag) {
-        if (preg_match($metatag, $str, $matches)) break;
-      }
+function lookupFileByToken($token) {
+    // SECURITY FIX: Token-based file access to eliminate path traversal
+    $allowedFiles = $this->getAllowedFilesFromConfig();
+    return isset($allowedFiles[$token]) ? $allowedFiles[$token] : null;
+}
+
 
       if (mb_detect_encoding($str) == '') {
         if (isset($matches[1])) {
