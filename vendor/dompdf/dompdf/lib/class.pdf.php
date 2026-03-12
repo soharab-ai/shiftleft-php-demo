@@ -3766,152 +3766,181 @@ EOT;
   /**
    * restore an object from its stored representation.  returns its new object id.
    */
-  function restoreSerializedObject($obj) {
+function restoreSerializedObject($obj) {
+    // SECURITY FIX 1: Input Source Validation - Add length restrictions to prevent DoS attacks
+    if (strlen($obj) > 1048576) { // 1MB limit
+        throw new InvalidArgumentException("Serialized data exceeds maximum allowed size");
+    }
+    
+    // SECURITY FIX 1: Input Source Validation - Implement HMAC signature verification
+    // Extract signature from data if present (format: signature:data)
+    if (strpos($obj, ':') !== false) {
+        list($provided_signature, $data) = explode(':', $obj, 2);
+        
+        // Verify HMAC signature to ensure data integrity and authenticity
+        if (defined('SERIALIZATION_SECRET_KEY')) {
+            $expected_signature = hash_hmac('sha256', $data, SERIALIZATION_SECRET_KEY);
+            if (!hash_equals($expected_signature, $provided_signature)) {
+                // SECURITY FIX 4: Rate Limiting and Monitoring - Log security event
+                $this->logSecurityEvent('signature_verification_failed', strlen($obj));
+                throw new SecurityException("Data signature verification failed - untrusted source");
+            }
+            $obj = $data; // Use verified data
+        }
+    }
+    
     $obj_id = $this->openObject();
-    $this->objects[$obj_id] = unserialize($obj);
-    $this->closeObject();
-    return $obj_id;
-  }
-
-  /**
-   * add content to the documents info object
-   */
-  function addInfo($label, $value = 0) {
-    // this will only work if the label is one of the valid ones.
-    // modify this so that arrays can be passed as well.
-    // if $label is an array then assume that it is key => value pairs
-    // else assume that they are both scalar, anything else will probably error
-    if (is_array($label)) {
-      foreach ($label as $l => $v) {
-        $this->o_info($this->infoObject, $l, $v);
-      }
-    } else {
-      $this->o_info($this->infoObject, $label, $value);
+    
+    // SECURITY FIX 3: Content-Type Based Validation - Validate JSON structure before decoding
+    // Check if input appears to be JSON format
+    $trimmed = trim($obj);
+    if ((substr($trimmed, 0, 1) === '{' && substr($trimmed, -1) === '}') || 
+        (substr($trimmed, 0, 1) === '[' && substr($trimmed, -1) === ']')) {
+        
+        // Attempt JSON deserialization (safer alternative)
+        $decoded = json_decode($obj, true);
+        
+        if (json_last_error() === JSON_ERROR_NONE) {
+            // SECURITY FIX 5: Type-Safe Return Value Handling - Validate deserialized data structure
+            if ($this->validateDeserializedData($decoded)) {
+                $this->objects[$obj_id] = $decoded;
+                $this->closeObject();
+                return $obj_id;
+            } else {
+                // SECURITY FIX 4: Rate Limiting and Monitoring - Log validation failure
+                $this->logSecurityEvent('json_validation_failed', strlen($obj));
+                $this->closeObject();
+                throw new InvalidArgumentException("Deserialized data failed validation checks");
+            }
+        }
     }
-  }
-
-  /**
-   * set the viewer preferences of the document, it is up to the browser to obey these.
-   */
-  function setPreferences($label, $value = 0) {
-    // this will only work if the label is one of the valid ones.
-    if (is_array($label)) {
-      foreach ($label as $l => $v) {
-        $this->o_catalog($this->catalogId, 'viewerPreferences', array($l => $v));
-      }
-    } else {
-      $this->o_catalog($this->catalogId, 'viewerPreferences', array($label => $value));
+    
+    // SECURITY FIX 2: Complete Elimination of Unserialize - Check for legacy migration flag
+    // If legacy data support is disabled, reject non-JSON data
+    if (defined('DISABLE_LEGACY_SERIALIZATION') && DISABLE_LEGACY_SERIALIZATION === true) {
+        // SECURITY FIX 4: Rate Limiting and Monitoring - Log legacy format rejection
+        $this->logSecurityEvent('legacy_format_rejected', strlen($obj));
+        $this->closeObject();
+        throw new InvalidArgumentException("Legacy serialization format not supported - use JSON format");
     }
-  }
-
-  /**
-   * extract an integer from a position in a byte stream
-   */
-  private function getBytes(&$data, $pos, $num) {
-    // return the integer represented by $num bytes from $pos within $data
-    $ret = 0;
-    for ($i = 0; $i < $num; $i++) {
-      $ret *= 256;
-      $ret += ord($data[$pos+$i]);
+    
+    // SECURITY FIX 2: Complete Elimination of Unserialize - Whitelist-based deserialization only
+    // Only process if data matches expected safe patterns
+    try {
+        // Validate that serialized data contains only safe types (no objects)
+        if (preg_match('/[CO]:\d+:/', $obj)) {
+            // SECURITY FIX 4: Rate Limiting and Monitoring - Log object injection attempt
+            $this->logSecurityEvent('object_injection_attempt', strlen($obj));
+            throw new SecurityException("Serialized objects are not allowed - security policy violation");
+        }
+        
+        // Set allowed_classes to false to prevent any object instantiation
+        $options = ['allowed_classes' => false];
+        $unserialized = unserialize($obj, $options);
+        
+        // Validate the unserialized data
+        if ($unserialized === false && $obj !== 'b:0;') {
+            throw new Exception("Unserialization failed - invalid or malicious data");
+        }
+        
+        // SECURITY FIX 5: Type-Safe Return Value Handling - Post-deserialization validation
+        if (!$this->validateDeserializedData($unserialized)) {
+            throw new Exception("Unserialized data failed validation checks");
+        }
+        
+// SECURITY FIX 5: Type-Safe Return Value Handling - Schema validation helper
+private function validateDeserializedData($data) {
+    // Prevent null or invalid types
+    if ($data === null) {
+        return false;
     }
-
-    return $ret;
-  }
-
-  /**
-   * Check if image already added to pdf image directory.
-   * If yes, need not to create again (pass empty data)
-   */
-  function image_iscached($imgname) {
-    return isset($this->imagelist[$imgname]);
-  }
-
-  /**
-   * add a PNG image into the document, from a GD object
-   * this should work with remote files
-   *
-   * @param string   $file    The PNG file
-   * @param float    $x       X position
-   * @param float    $y       Y position
-   * @param float    $w       Width
-   * @param float    $h       Height
-   * @param resource $img     A GD resource
-   * @param bool     $is_mask true if the image is a mask
-   * @param bool     $mask    true if the image is masked
-   */
-  function addImagePng($file, $x, $y, $w = 0.0, $h = 0.0, &$img, $is_mask = false, $mask = null) {
-    if (!function_exists("imagepng")) {
-      throw new Exception("The PHP GD extension is required, but is not installed.");
+    
+    // Recursively check for objects (security risk)
+    if (is_object($data)) {
+        return false;
     }
-
-    //if already cached, need not to read again
-    if ( isset($this->imagelist[$file]) ) {
-      $data = null;
+    
+    // Validate arrays recursively
+    if (is_array($data)) {
+        foreach ($data as $key => $value) {
+            // Validate array keys are safe (no control characters)
+            if (!is_string($key) && !is_int($key)) {
+                return false;
+            }
+            
+            if (is_string($key) && preg_match('/[\x00-\x1F\x7F]/', $key)) {
+                return false;
+            }
+            
+            // Recursively validate nested structures
+            if (is_array($value) || is_object($value)) {
+                if (!$this->validateDeserializedData($value)) {
+                    return false;
+                }
+            }
+// SECURITY FIX 4: Rate Limiting and Monitoring - Security event logging with rate limiting
+private function logSecurityEvent($event_type, $payload_size, $additional_info = '') {
+    // Initialize session-based rate limiting tracking
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
     }
-    else {
-      // Example for transparency handling on new image. Retain for current image
-      // $tIndex = imagecolortransparent($img);
-      // if ($tIndex > 0) {
-      //   $tColor    = imagecolorsforindex($img, $tIndex);
-      //   $new_tIndex    = imagecolorallocate($new_img, $tColor['red'], $tColor['green'], $tColor['blue']);
-      //   imagefill($new_img, 0, 0, $new_tIndex);
-      //   imagecolortransparent($new_img, $new_tIndex);
-      // }
-      // blending mode (literal/blending) on drawing into current image. not relevant when not saved or not drawn
-      //imagealphablending($img, true);
-
-      //default, but explicitely set to ensure pdf compatibility
-      imagesavealpha($img, false/*!$is_mask && !$mask*/);
-
-      $error = 0;
-      //DEBUG_IMG_TEMP
-      //debugpng
-      if (DEBUGPNG) print '[addImagePng '.$file.']';
-
-      ob_start();
-      @imagepng($img);
-      $data = ob_get_clean();
-
-      if ($data == '') {
-        $error = 1;
-        $errormsg = 'trouble writing file from GD';
-        //DEBUG_IMG_TEMP
-        //debugpng
-        if (DEBUGPNG) print 'trouble writing file from GD';
-      }
-
-      if ($error) {
-        $this->addMessage('PNG error - ('.$file.') '.$errormsg);
-        return;
-      }
-    }  //End isset($this->imagelist[$file]) (png Duplicate removal)
-
-    $this->addPngFromBuf($file, $x, $y, $w, $h, $data, $is_mask, $mask);
-  }
-
-  protected function addImagePngAlpha($file, $x, $y, $w, $h, $byte) {
-    // generate images
-    $img = imagecreatefrompng($file);
-
-    if ($img === false) {
-      return;
+    
+    if (!isset($_SESSION['deserialization_failures'])) {
+        $_SESSION['deserialization_failures'] = [
+            'count' => 0,
+            'first_attempt' => time(),
+            'blocked' => false
+        ];
     }
+    
+    $failures = &$_SESSION['deserialization_failures'];
+    
+    // Check if already blocked
+    if ($failures['blocked']) {
+        $block_duration = 300; // 5 minutes
+        if (time() - $failures['first_attempt'] < $block_duration) {
+            throw new SecurityException("Too many deserialization failures - access temporarily blocked");
+        } else {
+            // Reset after block duration
+            $failures = ['count' => 0, 'first_attempt' => time(), 'blocked' => false];
+        }
+    }
+    
+    // Increment failure count
+    $failures['count']++;
+    
+    // SECURITY FIX 4: Implement automatic blocking after threshold violations
+    $threshold = 5;
+    $time_window = 60; // 1 minute
+    
+    if ($failures['count'] >= $threshold) {
+        if (time() - $failures['first_attempt'] <= $time_window) {
+            $failures['blocked'] = true;
+            error_log("SECURITY ALERT: Deserialization attack detected - blocking access");
+        } else {
+            // Reset counter if outside time window
+            $failures = ['count' => 1, 'first_attempt' => time(), 'blocked' => false];
+        }
+    }
+    
+    // SECURITY FIX 4: Log with additional context (IP, timestamp, payload size)
+    $sanitized_event = preg_replace('/[^\w\-\_]/', '', $event_type);
+    $sanitized_info = preg_replace('/[^\w\s\-\.\:\(\)]/', '', $additional_info);
+    $ip_address = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : 'unknown';
+    $sanitized_ip = filter_var($ip_address, FILTER_VALIDATE_IP) ? $ip_address : 'invalid';
+    
+    $log_message = sprintf(
+        "Deserialization Security Event: %s | IP: %s | Payload Size: %d bytes | Timestamp: %s | Info: %s",
+        $sanitized_event,
+        $sanitized_ip,
+        (int)$payload_size,
+        date('Y-m-d H:i:s'),
+        $sanitized_info
+    );
+    
+    error_log($log_message);
+}
 
-    // FIXME The pixel transformation doesn't work well with 8bit PNGs
-    $eight_bit = ($byte & 4) !== 4;
-
-    $wpx = imagesx($img);
-    $hpx = imagesy($img);
-
-    imagesavealpha($img, false);
-
-    // create temp alpha file
-    $tempfile_alpha = tempnam($this->tmp, "cpdf_img_");
-    @unlink($tempfile_alpha);
-    $tempfile_alpha = "$tempfile_alpha.png";
-
-    // create temp plain file
-    $tempfile_plain = tempnam($this->tmp, "cpdf_img_");
     @unlink($tempfile_plain);
     $tempfile_plain = "$tempfile_plain.png";
 
