@@ -182,7 +182,7 @@ switch ( $sapi ) {
   }
 
   if ( isset($opts['t']) ) {
-    $arr = split(',',$opts['t']);
+    $arr = explode(',',$opts['t']);
     $types = array();
     foreach ($arr as $type)
       $types[ trim($type) ] = 1;
@@ -197,10 +197,53 @@ switch ( $sapi ) {
 
   $dompdf->set_option('enable_php', false);
   
-  if ( isset($_GET["input_file"]) )
+  // SECURITY FIX: Validate and sanitize input_file parameter with iterative decoding
+  if ( isset($_GET["input_file"]) ) {
     $file = rawurldecode($_GET["input_file"]);
-  else
+    
+    // SECURITY FIX: Iterative decoding to prevent double-encoding attacks
+    $decoded = $file;
+    $iteration = 0;
+    while ($decoded !== ($next_decode = rawurldecode($decoded)) && $iteration < 3) {
+      $decoded = $next_decode;
+      $iteration++;
+    }
+    if ($iteration >= 3) {
+      throw new DOMPDF_Exception("Multiple encoding layers detected in input_file parameter.");
+    }
+    $file = $decoded;
+    
+    // SECURITY FIX: Remove null bytes to prevent null byte injection
+    $file = str_replace(chr(0), '', $file);
+    
+    // SECURITY FIX: Normalize Unicode characters
+    if (class_exists('Normalizer')) {
+      $file = Normalizer::normalize($file, Normalizer::FORM_C);
+    }
+    
+    // SECURITY FIX: Check for any ".." occurrence to catch all traversal patterns
+    if (strpos($file, '..') !== false) {
+      throw new DOMPDF_Exception("Invalid file path: directory traversal detected in input_file parameter.");
+    }
+    
+    // SECURITY FIX: Reject URL-encoded traversal patterns
+    if (preg_match('/\.\.%/', $file)) {
+      throw new DOMPDF_Exception("Invalid file path: encoded directory traversal detected in input_file parameter.");
+    }
+    
+    // SECURITY FIX: Early chroot validation if chroot is defined
+    if (defined('DOMPDF_CHROOT')) {
+      $file_real = realpath($file);
+      if ($file_real !== false) {
+        $chroot_real = realpath(DOMPDF_CHROOT);
+        if (strpos($file_real, $chroot_real) !== 0) {
+          throw new DOMPDF_Exception("File outside chroot boundary.");
+        }
+      }
+    }
+  } else {
     throw new DOMPDF_Exception("An input file is required (i.e. input_file _GET variable).");
+  }
   
   if ( isset($_GET["paper"]) )
     $paper = rawurldecode($_GET["paper"]);
@@ -212,9 +255,35 @@ switch ( $sapi ) {
   else
     $orientation = "portrait";
   
+  // SECURITY FIX: Validate and sanitize base_path parameter
   if ( isset($_GET["base_path"]) ) {
     $base_path = rawurldecode($_GET["base_path"]);
-    $file = $base_path . $file; # Set the input file
+    
+    // SECURITY FIX: Remove null bytes from base_path
+    $base_path = str_replace(chr(0), '', $base_path);
+    
+    // SECURITY FIX: Normalize Unicode in base_path
+    if (class_exists('Normalizer')) {
+      $base_path = Normalizer::normalize($base_path, Normalizer::FORM_C);
+    }
+    
+    // SECURITY FIX: Validate base_path doesn't contain traversal sequences
+    if (strpos($base_path, '..') !== false) {
+      throw new DOMPDF_Exception("Invalid base path: directory traversal detected in base_path parameter.");
+    }
+    
+    // SECURITY FIX: Secure path concatenation with proper validation
+    $combined_path = realpath($base_path . DIRECTORY_SEPARATOR . $file);
+    if ($combined_path === false) {
+      throw new DOMPDF_Exception("Invalid file path after concatenation.");
+    }
+    
+    $base_real = realpath($base_path);
+    if ($base_real === false || strpos($combined_path, $base_real) !== 0) {
+      throw new DOMPDF_Exception("Invalid file path after concatenation: file outside base path.");
+    }
+    
+    $file = $combined_path;
   }  
   
   if ( isset($_GET["options"]) ) {
@@ -277,3 +346,4 @@ if ( $save_file ) {
 if ( !headers_sent() ) {
   $dompdf->stream($outfile, $options);
 }
+
